@@ -10,7 +10,9 @@ on:
       PR_REF:
         type: string
         required: true
-
+    secrets:
+      PAT:
+        required: true
 jobs:
   lint:
     runs-on: ubuntu-latest
