@@ -1,0 +1,391 @@
+name: E2E Build and Release
+
+on:
+  # On pull request, trigger this workflow to release into beta environment
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/e2e-release.yml'
+
+  workflow_call:
+    inputs:
+      # What repo to get the patterns content from. Default to official repo,
+      # but can be set to a fork, for previewing a fork
+      PATTERNS_REPO:
+        type: string
+        default: aws-samples/container-patterns
+        required: false
+
+      # What SHA to deploy from the patterns site, defaults to latest main commit
+      PATTERNS_REF:
+        type: string
+        default: 'main'
+        required: false
+
+      # What repo to get the Vitepress theme from. If a fork is not
+      # specified, then default to the official private repo
+      VITEPRESS_THEME_REPO:
+        type: string
+        default: project-gretchen/vitepress-theme
+        required: false
+
+      # What SHA to deploy from the Vitepress theme, defaults to latest main commit
+      VITEPRESS_THEME_REF:
+        type: string
+        default: 'main'
+        required: false
+
+      # What repo to get the ECS blog from. If a fork is not
+      # specified then default to the official private repo
+      BLOG_REPO:
+        type: string
+        default: project-gretchen/ecs-blog
+        required: false
+
+      # What SHA to deploy from the blog, defaults to latest main commit
+      BLOG_REF:
+        type: string
+        default: 'main'
+        required: false
+
+      # What repo to get the infra resources from. Default to official repo,
+      # but can be set to a fork, for previewing a fork
+      INFRA_REPO:
+        type: string
+        default: project-gretchen/infrastructure
+        required: false
+
+      # What SHA to get infra rewsources from; defaults to latest main commit
+      INFRA_REF:
+        type: string
+        default: 'main'
+        required: false
+
+      # A desired name for the environment to deploy to, defaults to releasing to the
+      # beta environment if nothing is passed.
+      ENVIRONMENT_ID:
+        type: string
+        default: 'beta'
+        required: false
+      
+      # Used for GitHub Actions environments for child repos to see deployment history in pull_request or production environments
+      ENVIRONMENT:
+        type: string
+        required: false
+      
+    secrets:
+      PAT:
+        required: true
+
+    # Map the workflow outputs to job outputs
+    outputs:
+      environment_url:
+        description: "The URL of the deployed environment"
+        value: ${{ jobs.release-to-amplify.outputs.amplify_url }}
+
+jobs:
+  # Build the patterns site
+  build-patterns:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+
+      # Check out the Vitepress theme
+      - name: Check out Vitepress theme
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ inputs.VITEPRESS_THEME_REPO || 'project-gretchen/vitepress-theme' }} 
+          ref: ${{ inputs.VITEPRESS_THEME_REF || 'main' }}
+          token: ${{ secrets.PAT }}
+          path: theme
+
+      # Check out the public repo that has the content
+      - name: Check out pattern content
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ inputs.PATTERNS_REPO || 'aws-samples/container-patterns' }} 
+          ref: ${{ inputs.PATTERNS_REF || 'main' }}
+          token: ${{ secrets.PAT }}
+          path: content
+      
+      # Glue the theme and content together into one merged directory
+      # Note that in order for the build to work properly the theme must
+      # be merged in AFTER the content, as it's package.json contains the
+      # build instructions and right dependencies for the build.
+      - name: Glue together Vitepress theme and pattern content
+        run: |
+          mkdir merged
+          mkdir merged/src
+          rsync -av --exclude CONTRIBUTING.md --exclude .git ./content/ ./merged/src
+          rsync -av --exclude .git ./theme/ ./merged
+
+      # Install Node v18
+      - name: Use Node.js v18.x
+        uses: actions/setup-node@v3
+        with:
+          node-version: v18.x
+          # This will maintain a cache of NPM packages if possible
+          cache: 'npm'
+          cache-dependency-path: ./merged
+
+      - name: Install NPM dependencies
+        run: npm ci
+        working-directory: ./merged
+
+      # Run the Vitepress build
+      - name: Building the patterns pages
+        run: npm run build --if-present
+        working-directory: ./merged
+
+      # Publish Files
+      - uses: actions/upload-artifact@v3
+        with:
+          name: patterns
+          path: ./merged/.vitepress/dist
+
+  # Build the Hugo blog
+  build-blog:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      HUGO_VERSION: ${{ vars.HUGO_VERSION }}
+    steps:
+
+      # Checkout the blog code
+      - name: Checkout Hugo blog
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ inputs.BLOG_REPO || 'project-gretchen/ecs-blog' }} 
+          ref: ${{ inputs.BLOG_REF || 'main' }}
+          token: ${{ secrets.PAT }}
+          path: blog
+
+      # Install hugo
+      - name: Install Hugo
+        run: |
+          wget https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_Linux-64bit.tar.gz
+          tar --overwrite -xf hugo_extended_${HUGO_VERSION}_Linux-64bit.tar.gz hugo
+          rm -rf hugo_extended_${HUGO_VERSION}_Linux-64bit.tar.gz
+          ./hugo version
+
+      # Run the Hugo build
+      - name: Hugo build
+        run: ../hugo
+        working-directory: ./blog
+
+      # Publish Files
+      - uses: actions/upload-artifact@v3
+        with:
+          name: blog
+          path: ./blog/public
+
+  # Ensure that the Amplify application exists
+  amplify-infra:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      amplify_id: ${{ steps.extract_amplify_id.outputs.amplify_id }}
+      environment: ${{ steps.environment-pr-config.outputs.environment}}
+      environment_id: ${{ steps.environment-pr-config.outputs.environment_id}}
+    steps:
+
+      # Checkout the code of this own repo
+      - name: Check out infra resources
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ inputs.INFRA_REPO || github.repository }} 
+          ref: ${{ inputs.INFRA_REF || github.event.pull_request.head.ref || 'main' }}
+          token: ${{ secrets.PAT }}
+          path: infra
+
+      # Configure the environment
+      - name: Configure the PR environment
+        if: github.event.repository.name == 'infrastructure' && github.event_name == 'pull_request'
+        id: environment-pr-config 
+        run: |
+          echo "environment=pull_request" >> $GITHUB_OUTPUT
+          echo "environment_id=${{ github.event.repository.name }}-${{ github.event.pull_request.id }}" >> $GITHUB_OUTPUT
+
+      # Connect to the Isengard account that hosts the site
+      # See: https://github.com/aws-actions/configure-aws-credentials
+      # See Also: https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ vars.RELEASE_ROLE }}
+          role-session-name: WebRelease
+          aws-region: us-east-2
+
+      - name: CloudFormation update
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ inputs.ENVIRONMENT_ID || steps.environment-pr-config.outputs.environment_id || 'beta' }}-app \
+            --capabilities CAPABILITY_IAM \
+            --template-file ./iac/amplify.yml \
+            --parameter-overrides BranchName=${{ inputs.ENVIRONMENT_ID || steps.environment-pr-config.outputs.environment_id || 'beta' }} AppName=${{ inputs.ENVIRONMENT_ID || steps.environment-pr-config.outputs.environment_id || 'beta' }}-app
+        working-directory: ./infra
+
+      # Get app id output
+      - name: Extract app ID from the CFN stack outputs
+        shell: bash
+        run: |
+          AMPLIFY_ID=$(aws cloudformation describe-stacks \
+            --stack-name ${{ inputs.ENVIRONMENT_ID || steps.environment-pr-config.outputs.environment_id || 'beta' }}-app \
+            --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppId'].OutputValue" \
+            --output text);
+          echo "amplify_id=${AMPLIFY_ID}" >> $GITHUB_OUTPUT
+        id: extract_amplify_id
+
+      # Confirm app ID
+      - name: Output app ID
+        run: |
+          echo ${{ steps.extract_amplify_id.outputs.amplify_id }}
+
+  # Glue build artifacts into one release, and do an Amplify deploy
+  release-to-amplify:
+    runs-on: ubuntu-latest
+    needs:
+      - build-patterns
+      - build-blog
+      - amplify-infra
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AMPLIFY_ID: ${{ needs.amplify-infra.outputs.amplify_id }}
+      BUCKET_NAME: ${{ vars.BUCKET_NAME }}
+    environment:
+      # if environment is passed from the caller repo, use the first option, if workflow is triggered by PR on this repo, use environment parsed locally which will default to 'pull_request', if first 2 aren't available, default to beta env
+      name: ${{ inputs.environment || needs.amplify-infra.outputs.environment || 'beta' }} 
+      # Support added for deployment environment variables i.e. (beta / prod); if no environment variable found, use amplify url instead
+      url: ${{ vars.environment_url || steps.amplify_url.outputs.amplify_url }}
+    outputs:
+      amplify_url: ${{ vars.environment_url || steps.amplify_url.outputs.amplify_url }}
+    steps:
+
+      # Checkout the code of this own repo      
+      - name: Check out infra resources
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ inputs.INFRA_REPO || github.repository }} 
+          ref: ${{ inputs.INFRA_REF || github.event.pull_request.head.ref }}
+          token: ${{ secrets.PAT }}
+          path: infra
+
+      # Install Node v18
+      - name: Use Node.js v18.x
+        uses: actions/setup-node@v3
+        with:
+          node-version: v18.x
+          cache-dependency-path: ./infra/package-lock.json
+          # This will maintain a cache of NPM packages if possible
+          cache: 'npm'
+
+      # Install NPM dependencies for ./build-scripts
+      - name: Install NPM dependencies
+        working-directory: ./infra
+        run: npm ci
+
+      # Connect to the Isengard account that hosts the site
+      # See: https://github.com/aws-actions/configure-aws-credentials
+      # See Also: https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ vars.RELEASE_ROLE }}
+          role-session-name: WebRelease
+          aws-region: us-east-2
+
+      - name: Preinitialize the release folder
+        run: |
+          mkdir ./release
+          mkdir ./release/pattern
+      
+      - name: Download blog artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: blog
+          path: ./release
+
+      - name: Download pattern artifaacts
+        uses: actions/download-artifact@v3
+        with:
+          name: patterns
+          path: ./release/pattern
+
+      # Add GitHub Step Summary Header
+      - name: Building Summary Report
+        run: echo "### 🚀 Appsec and CSP Results" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Appsec vulnerability reporting
+        run: |
+          mkdir ./release/.well-known/
+          curl https://aws.amazon.com/.well-known/security.txt -o ./release/.well-known/security.txt
+
+          echo "✅ Vulnerability Reporting Added" >> $GITHUB_STEP_SUMMARY
+
+      # Required by App Sec
+      - name: Calculate CSP hashes and add them to HTML
+        run: |
+          node ../infra/build-scripts/add-csp.js
+
+          echo "✅ CSP Hashes added to HTML" >> $GITHUB_STEP_SUMMARY
+        working-directory: ./release
+      
+      # Generate deployment package
+      - name: Generate Deployment Package
+        run: zip -r ../release.zip .
+        working-directory: ./release
+      
+      # Publish deployment package as a pipeline artifact
+      - uses: actions/upload-artifact@v3
+        with:
+          name: deployment
+          path: ./release
+
+      # Push deployment to S3 bucket for Amplify
+      - name: Push release to s3
+        run: aws s3 cp ./release.zip s3://${BUCKET_NAME}/${GITHUB_RUN_ID}.zip
+
+      # Start Amplify Deployment
+      - name: Start Amplify deployment
+        run: ./scripts/amplify-deploy.sh ${AMPLIFY_ID} ${{ inputs.ENVIRONMENT_ID || needs.amplify-infra.outputs.environment_id }}
+        working-directory: infra
+      
+      - name: Get amplify URL
+        id: amplify_url
+        run: |
+          echo "amplify_url=https://${{ inputs.ENVIRONMENT_ID || needs.amplify-infra.outputs.environment_id }}.${AMPLIFY_ID}.amplifyapp.com" >> "$GITHUB_OUTPUT"
+      
+      - name: Add success message to GitHub Actions Summary
+        if: ${{ success() && github.event_name == 'pull_request' && github.event.action != 'closed'}}
+        run: |
+          echo "### 🚀 Pull Request Successfully Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [Preview URL here](${{ steps.amplify_url.outputs.amplify_url }})" >> $GITHUB_STEP_SUMMARY
+
+      - name: Add workflow inputs to GitHub Actions Summary
+        if: inputs.ENVIRONMENT_ID
+        run: |
+          {
+            echo "### Inputs used"
+            echo "| Arg                   | Value |"
+            echo "| -------------------   | ----- |"
+            echo "| BLOG_REPO             | ${{ inputs.BLOG_REPO }} |"
+            echo "| BLOG_REF              | ${{ inputs.BLOG_REF }} |"
+            echo "| ENVIRONMENT           | ${{ inputs.ENVIRONMENT }} |"
+            echo "| ENVIRONMENT_ID        | ${{ inputs.ENVIRONMENT_ID }} |"
+            echo "| INFRA_REPO            | ${{ inputs.INFRA_REPO }} |"
+            echo "| INFRA_REF             | ${{ inputs.INFRA_REF }} |"
+            echo "| PATTERNS_REPO         | ${{ inputs.PATTERNS_REPO }} |"
+            echo "| PATTERNS_REF          | ${{ inputs.PATTERNS_REF }} |"
+            echo "| VITEPRESS_THEME_REPO  | ${{ inputs.VITEPRESS_THEME_REPO }} |"
+            echo "| VITEPRESS_THEME_REF   | ${{ inputs.VITEPRESS_THEME_REF }} |"
+          } >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,77 @@
+name: Lint
+
+on:
+  workflow_call:
+    inputs:
+      PR_REPO:
+        type: string
+        required: true
+
+      PR_REF:
+        type: string
+        required: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout the pull request's fork and lint it
+      - uses: actions/checkout@v3
+        with:
+          repository: ${{ inputs.PR_REPO }}
+          ref: ${{ inputs.PR_REF }}
+          # Can be removed once repo is fully public and forks are public too
+          token: ${{ secrets.PAT }}
+
+      # Install Node and NPM dependencies
+      - name: Use Node.js v18.x
+        uses: actions/setup-node@v3
+        with:
+          node-version: v18.x
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build --if-present
+
+      # Run the linter to validate markdown content
+      - run: npm run lint
+    
+      # Add GitHub Step Summary Header
+      - name: Building Summary Report
+        run: echo "### 🚀 Linter Results" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Adding linter results to GitHub Actions Summary on success
+        if: ${{ success() }}
+        run: echo "✅ Linter Passed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Adding linter results to GitHub Actions Summary on failure
+        if: ${{ failure() }}
+        run: |
+          {
+            echo "❌ Linter failed!"
+            echo "Please see actions run log for more details"
+            echo ""
+            echo "Alternatively, you can run the following locally on your development system:"
+            echo "**Note: node and npm are required**"
+            echo  "```"
+            echo "npm install"
+            echo "npm run lint"
+            echo "```"
+          }
+
+      - name: Adding linter results to GitHub Actions Summary on cancelled
+        if: ${{ cancelled() }}
+        run: |
+          {
+            echo "⚠️ Linting workflow was cancelled!"
+          } >> $GITHUB_STEP_SUMMARY
+      
+      - name: Add workflow inputs to GitHub Actions Summary
+        if: inputs.PR_REPO
+        run: |
+          {
+            echo "### Inputs Used"
+            echo "| Arg                 | Value |"
+            echo "| ------------------- | ----- |"
+            echo "| PR_REPO        | ${{ inputs.PR_REPO }} |"
+            echo "| PR_REF       | ${{ inputs.PR_REF }} |"
+          } >> $GITHUB_STEP_SUMMARY  
